@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.DS_Store
+input_1mb.bin
+recv*.bin
+received*.bin
+smoke*.bin
+metrics_out/
