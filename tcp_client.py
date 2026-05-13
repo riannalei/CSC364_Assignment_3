@@ -1,5 +1,4 @@
-# CSC364 A3 - send a 1MB file over fake TCP (UDP underneath)
-# Reno-ish: slow start, congestion avoidance, fast retransmit, 500ms timeout
+# a3 client — udp send with reno-ish cwnd + checksums
 
 import argparse
 import json
@@ -10,18 +9,16 @@ import time
 
 MSS = 1024
 FILE_BYTES = 1024 * 1024
-TIMEOUT = 0.5  # seconds, spec
-RTT_FOR_PLOTS = 0.1  # x axis for cwnd graph = seconds / this (rough RTT ticks)
+TIMEOUT = 0.5
+RTT_SCALE = 0.1  # for graph x axis (we pretend 100ms rtt)
 
 
 def cksum(payload):
-    # assignment: sum of bytes mod 65535
     return sum(payload) % 65535
 
 
 def make_pkt(seq, payload):
-    c = cksum(payload)
-    return struct.pack("!IH", seq, c) + payload
+    return struct.pack("!IH", seq, cksum(payload)) + payload
 
 
 class Client:
@@ -37,11 +34,9 @@ class Client:
         self.dupacks = 0
         self.fast_recovery = False
 
-        # seq -> [payload bytes, last_send_time]
-        self.outstanding = {}
+        self.outstanding = {}  # seq -> [bytes, time sent]
         self.num_retrans = 0
 
-        # for graphs
         self.t0 = time.monotonic()
         self.log_times = []
         self.log_cwnd = []
@@ -50,68 +45,63 @@ class Client:
         self.last_snap = None
 
     def window_bytes(self):
-        # cwnd is in "packets" in the handout; I treat 1 packet = MSS bytes
         w = int(self.cwnd)
         if w < 1:
             w = 1
         return w * MSS
 
-    def bytes_in_flight(self):
+    def in_flight(self):
         return self.next_seq - self.send_base
 
-    def can_send_more(self):
+    def can_send(self):
         if self.next_seq >= FILE_BYTES:
             return False
-        return self.bytes_in_flight() < self.window_bytes()
+        return self.in_flight() < self.window_bytes()
 
     def send_chunk(self, seq, payload, retrans):
         self.sock.sendto(make_pkt(seq, payload), self.addr)
-        now = time.monotonic()
-        self.outstanding[seq] = [payload, now]
+        t = time.monotonic()
+        self.outstanding[seq] = [payload, t]
         if retrans:
             self.num_retrans += 1
 
-    def pump_new_data(self):
-        while self.can_send_more():
+    def send_new(self):
+        while self.can_send():
             chunk = self.data[self.next_seq : self.next_seq + MSS]
-            if len(chunk) == 0:
+            if not chunk:
                 break
             self.send_chunk(self.next_seq, chunk, False)
             self.next_seq += len(chunk)
 
-    def rtx_oldest(self):
+    def resend_oldest(self):
         if self.send_base >= FILE_BYTES:
             return
         seq = self.send_base
-        chunk = self.data[seq : seq + MSS]
-        self.send_chunk(seq, chunk, True)
+        self.send_chunk(seq, self.data[seq : seq + MSS], True)
 
     def on_timeout(self):
         self.ssthresh = max(self.cwnd / 2.0, 2.0)
         self.cwnd = 1.0
         self.dupacks = 0
         self.fast_recovery = False
-        self.rtx_oldest()
+        self.resend_oldest()
 
     def on_ack(self, ack):
-        # ack = next byte receiver wants (cumulative)
         if ack < self.send_base:
             return
 
         if ack > self.send_base:
             self.dupacks = 0
-            new_bytes = ack - self.send_base
-            segs = new_bytes // MSS
-            if segs <= 0:
+            segs = (ack - self.send_base) // MSS
+            if segs < 1:
                 segs = 1
 
-            # drop acked segments from outstanding dict
-            kill = []
+            gone = []
             for s in self.outstanding:
-                plen = len(self.outstanding[s][0])
-                if s + plen <= ack:
-                    kill.append(s)
-            for s in kill:
+                ln = len(self.outstanding[s][0])
+                if s + ln <= ack:
+                    gone.append(s)
+            for s in gone:
                 del self.outstanding[s]
             self.send_base = ack
 
@@ -120,14 +110,11 @@ class Client:
                 self.fast_recovery = False
             else:
                 if self.cwnd < self.ssthresh:
-                    # slow start
                     self.cwnd += float(segs)
                 else:
-                    # AIMD-ish: bump a little per acked segment
                     self.cwnd += float(segs) / self.cwnd
             return
 
-        # duplicate ack (ack == send_base)
         if self.send_base >= self.next_seq:
             return
         self.dupacks += 1
@@ -138,64 +125,61 @@ class Client:
             if not self.fast_recovery:
                 self.cwnd = self.ssthresh + 3.0
                 self.fast_recovery = True
-                self.rtx_oldest()
+                self.resend_oldest()
         elif self.fast_recovery:
             self.cwnd += 1.0
 
     def snapshot(self):
-        # only log when something actually changed (keeps json smaller)
-        key = (self.send_base, self.cwnd, self.num_retrans)
-        if key == self.last_snap:
+        k = (self.send_base, self.cwnd, self.num_retrans)
+        if k == self.last_snap:
             return
-        self.last_snap = key
+        self.last_snap = k
         elapsed = time.monotonic() - self.t0
         self.log_times.append(elapsed)
         self.log_cwnd.append(self.cwnd)
-        self.log_rtt_units.append(elapsed / RTT_FOR_PLOTS)
+        self.log_rtt_units.append(elapsed / RTT_SCALE)
         self.log_retrans.append(self.num_retrans)
 
-    def drain_acks(self, first_buf):
-        bufs = [first_buf]
+    def drain(self, first):
+        chunks = [first]
         self.sock.setblocking(False)
         try:
             while True:
                 try:
                     b, _ = self.sock.recvfrom(4096)
-                    bufs.append(b)
+                    chunks.append(b)
                 except BlockingIOError:
                     break
         finally:
             self.sock.setblocking(True)
-
-        for b in bufs:
-            if len(b) < 4:
-                continue
-            ack = struct.unpack("!I", b[:4])[0]
-            self.on_ack(ack)
-            self.snapshot()
+        for b in chunks:
+            if len(b) >= 4:
+                ack = struct.unpack("!I", b[:4])[0]
+                self.on_ack(ack)
+                self.snapshot()
 
     def run(self):
-        self.pump_new_data()
+        self.send_new()
         self.snapshot()
 
         while self.send_base < FILE_BYTES:
-            oldest = self.send_base
-            if oldest in self.outstanding:
-                remaining = TIMEOUT - (time.monotonic() - self.outstanding[oldest][1])
+            ob = self.send_base
+            if ob in self.outstanding:
+                left = TIMEOUT - (time.monotonic() - self.outstanding[ob][1])
             else:
-                remaining = TIMEOUT
-            if remaining < 0:
-                remaining = 0
+                left = TIMEOUT
+            if left < 0:
+                left = 0
 
-            r, _, _ = select.select([self.sock], [], [], remaining)
+            r, _, _ = select.select([self.sock], [], [], left)
             if r:
                 buf, _ = self.sock.recvfrom(4096)
-                self.drain_acks(buf)
+                self.drain(buf)
             else:
                 self.on_timeout()
                 self.snapshot()
 
-            self.pump_new_data()
+            self.send_new()
 
         self.sock.close()
 
@@ -212,7 +196,7 @@ def main():
     with open(args.file, "rb") as f:
         blob = f.read()
     if len(blob) != FILE_BYTES:
-        print("error: file must be exactly 1MB")
+        print("need exactly 1MB file")
         return
 
     c = Client(args.host, args.port, blob)

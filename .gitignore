@@ -2,7 +2,11 @@ __pycache__/
 *.pyc
 .DS_Store
 input_1mb.bin
+gistfile1.txt
 recv*.bin
 received*.bin
+received.txt
 smoke*.bin
 metrics_out/
+__test_recv.txt
+t_recv.txt

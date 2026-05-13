@@ -1,4 +1,4 @@
-# CSC364 A3 server - receives chunks, checks checksum, drops randomly, delayed ACKs
+# a3 server — udp recv, checksum, random drop, delayed acks
 
 import argparse
 import random
@@ -6,9 +6,7 @@ import socket
 import struct
 import threading
 
-HDR = 6  # 4 seq + 2 checksum
-MSS = 1024
-TOTAL = 1024 * 1024
+HDR = 6
 
 
 def cksum(payload):
@@ -18,44 +16,43 @@ def cksum(payload):
 def unpack(buf):
     if len(buf) < HDR:
         return None
-    seq, got_c = struct.unpack("!IH", buf[:HDR])
+    seq, got = struct.unpack("!IH", buf[:HDR])
     body = buf[HDR:]
-    if cksum(body) != got_c:
+    if cksum(body) != got:
         return None
     return seq, body
 
 
-class AckDelayer:
-    # first pkt after idle arms timer; more pkts before fire just update ack value (assignment RTT thing)
+class AckTimer:
+    # delayed ack: first pkt starts timer, rest update ack only
+
     def __init__(self, sock, peer, delay):
         self.sock = sock
         self.peer = peer
         self.delay = delay
         self.lock = threading.Lock()
         self.timer = None
-        self.busy = False
-        self.ackval = 0
+        self.pending = False
+        self.ack = 0
 
-    def push(self, ack):
+    def schedule(self, ack):
         with self.lock:
-            self.ackval = ack
-            if self.busy:
+            self.ack = ack
+            if self.pending:
                 return
-            self.busy = True
-            self.timer = threading.Timer(self.delay, self._go)
+            self.pending = True
+            self.timer = threading.Timer(self.delay, self._fire)
             self.timer.daemon = True
             self.timer.start()
 
-    def _go(self):
+    def _fire(self):
         with self.lock:
-            a = self.ackval
-            self.busy = False
+            a = self.ack
+            self.pending = False
             self.timer = None
         self.sock.sendto(struct.pack("!I", a), self.peer)
 
-    def wait_done(self):
-        # make sure last ack goes out before we exit
-        t = None
+    def flush(self):
         with self.lock:
             t = self.timer
         if t:
@@ -67,7 +64,7 @@ def main():
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=9999)
     ap.add_argument("--loss", type=float, default=0.0)
-    ap.add_argument("--output", default="received.bin")
+    ap.add_argument("--output", default="received.txt")
     ap.add_argument("--rtt", type=float, default=0.1)
     ap.add_argument("--seed", type=int, default=None)
     args = ap.parse_args()
@@ -82,15 +79,15 @@ def main():
     nxt = 0
     buf = bytearray()
     peer = None
-    acker = None
+    acks = None
 
     print("listening", args.host, args.port, "loss=", args.loss)
 
-    while nxt < TOTAL:
+    while nxt < 1024 * 1024:
         pkt, addr = s.recvfrom(8192)
         if peer is None:
             peer = addr
-            acker = AckDelayer(s, peer, args.rtt)
+            acks = AckTimer(s, peer, args.rtt)
         elif addr != peer:
             continue
 
@@ -98,30 +95,28 @@ def main():
             continue
 
         got = unpack(pkt)
-        if got is None:
+        if not got:
             continue
         seq, body = got
 
         if seq < nxt:
-            # already had this part
-            overlap = nxt - seq
-            if overlap >= len(body):
-                acker.push(nxt)
+            ov = nxt - seq
+            if ov >= len(body):
+                acks.schedule(nxt)
                 continue
-            body = body[overlap:]
+            body = body[ov:]
             seq = nxt
 
         if seq == nxt:
             buf.extend(body)
             nxt += len(body)
-        # if seq > nxt: out of order, ignore data but still ack nxt (dup ack)
 
-        acker.push(nxt)
+        acks.schedule(nxt)
 
-    acker.wait_done()
+    acks.flush()
 
     with open(args.output, "wb") as f:
-        f.write(buf[:TOTAL])
+        f.write(buf[: 1024 * 1024])
 
     s.close()
     print("saved", args.output)
